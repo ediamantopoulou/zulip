@@ -3,6 +3,7 @@ import hashlib
 import itertools
 import logging
 import os
+import secrets
 import time
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
@@ -1369,6 +1370,93 @@ def do_delete_user(user_profile: UserProfile) -> None:
             modified_user=replacement_user,
             acting_user=None,
             event_type=RealmAuditLog.USER_DELETED,
+            event_time=timezone_now(),
+        )
+
+
+def do_delete_user_preserving_messages(user_profile: UserProfile) -> None:
+    """
+    This is a version of do_delete_user which does not delete message content.
+
+    The code is a bit tricky, because we want to, at some point, call
+    user_profile.delete() to trigger cascade deletes to clean up the variety
+    of related objects - but we need to avoid the cascades affecting
+    messages sent by the user.
+    """
+    if user_profile.realm.is_zephyr_mirror_realm:
+        raise AssertionError("Deleting zephyr mirror users is not supported")
+
+    do_deactivate_user(user_profile, acting_user=None)
+
+    subscribed_huddle_recipient_ids = set(
+        Subscription.objects.filter(
+            user_profile=user_profile, recipient__type=Recipient.HUDDLE
+        ).values_list("recipient_id", flat=True)
+    )
+    user_id = user_profile.id
+    personal_recipient = user_profile.recipient
+    realm = user_profile.realm
+    date_joined = user_profile.date_joined
+
+    with transaction.atomic():
+        # The strategy is that before calling user_profile.delete(), we need to
+        # reassign Messages  sent by the user to a dummy user, so that they don't
+        # get affected by CASCADE. We cannot yet create a dummy user with .id
+        # matching that of the user_profile, so the general scheme is:
+        # 1. We create a *temporary* dummy for the initial re-assignment of messages.
+        # 2. We delete the UserProfile.
+        # 3. We create a replacement dummy user with its id matching what the UserProfile had.
+        # 4. This is the intended, final replacement UserProfile, so we re-assign
+        #    the messages from step (1) to it and delete the temporary dummy.
+        random_token = secrets.token_hex(16)
+        temp_replacement_user = create_user(
+            email=f"temp_deleteduser{random_token}@{get_fake_email_domain(realm)}",
+            password=None,
+            realm=realm,
+            full_name=f"Deleted User {random_token}",
+            active=False,
+            is_mirror_dummy=True,
+            force_date_joined=date_joined,
+            create_personal_recipient=False,
+        )
+        Message.objects.filter(sender=user_profile).update(sender=temp_replacement_user)
+        user_profile.delete()
+
+        replacement_user = create_user(
+            force_id=user_id,
+            email=f"deleteduser{user_id}@{get_fake_email_domain(realm)}",
+            password=None,
+            realm=realm,
+            full_name=f"Deleted User {user_id}",
+            active=False,
+            is_mirror_dummy=True,
+            force_date_joined=date_joined,
+            create_personal_recipient=False,
+        )
+        # We don't delete the personal recipient to preserve  personal messages!
+        # Now, the personal recipient belong to replacement_user, because
+        # personal_recipient.type_id is equal to replacement_user.id.
+        replacement_user.recipient = personal_recipient
+        replacement_user.save(update_fields=["recipient"])
+
+        Message.objects.filter(sender=temp_replacement_user).update(sender=replacement_user)
+        temp_replacement_user.delete()
+
+        subs_to_recreate = [
+            Subscription(
+                user_profile=replacement_user,
+                recipient=recipient,
+                is_user_active=replacement_user.is_active,
+            )
+            for recipient in Recipient.objects.filter(id__in=subscribed_huddle_recipient_ids)
+        ]
+        Subscription.objects.bulk_create(subs_to_recreate)
+
+        RealmAuditLog.objects.create(
+            realm=replacement_user.realm,
+            modified_user=replacement_user,
+            acting_user=None,
+            event_type=RealmAuditLog.USER_DELETED_PRESERVING_MESSAGES,
             event_time=timezone_now(),
         )
 
