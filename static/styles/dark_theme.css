@@ -281,7 +281,9 @@ body.dark-theme {
     }
 
     .rendered_markdown .message_inline_image {
-        background: hsla(0, 0%, 100%, 0.1);
+        &:hover {
+            background: hsla(0, 0%, 100%, 0.1);
+        }
     }
 
     input[type="text"],

@@ -338,8 +338,12 @@
            messages whose aspect ratio is different from that of this
            container. */
         border: solid 1px transparent;
-        background: hsla(0, 0%, 0%, 0.05);
+        transition: background 0.4s ease;
         border-radius: 4px;
+
+        &:hover {
+            background: hsla(0, 0%, 0%, 0.05);
+        }
 
         a {
             display: block;
